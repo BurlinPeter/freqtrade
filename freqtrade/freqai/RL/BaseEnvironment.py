@@ -292,12 +292,32 @@ class BaseEnvironment(gym.Env):
         if self._position == Positions.Neutral:
             return 0.0
         elif self._position == Positions.Short:
-            current_price = self.add_entry_fee(self.prices.iloc[self._current_tick].open)
-            last_trade_price = self.add_exit_fee(self.prices.iloc[self._last_trade_tick].open)
+            curr_price_raw = self.prices.iloc[self._current_tick]
+            if isinstance(curr_price_raw, pd.Series): 
+                if not curr_price_raw.empty: curr_price_raw = curr_price_raw.iloc[0]
+                else: return 0.0
+            current_price = self.add_entry_fee(float(curr_price_raw))
+            
+            last_price_raw = self.prices.iloc[self._last_trade_tick]
+            if isinstance(last_price_raw, pd.Series): 
+                if not last_price_raw.empty: last_price_raw = last_price_raw.iloc[0]
+                else: return 0.0
+            last_trade_price = self.add_exit_fee(float(last_price_raw))
+            
             return (last_trade_price - current_price) / last_trade_price
         elif self._position == Positions.Long:
-            current_price = self.add_exit_fee(self.prices.iloc[self._current_tick].open)
-            last_trade_price = self.add_entry_fee(self.prices.iloc[self._last_trade_tick].open)
+            curr_price_raw = self.prices.iloc[self._current_tick]
+            if isinstance(curr_price_raw, pd.Series): 
+                if not curr_price_raw.empty: curr_price_raw = curr_price_raw.iloc[0]
+                else: return 0.0
+            current_price = self.add_exit_fee(float(curr_price_raw))
+            
+            last_price_raw = self.prices.iloc[self._last_trade_tick]
+            if isinstance(last_price_raw, pd.Series): 
+                if not last_price_raw.empty: last_price_raw = last_price_raw.iloc[0]
+                else: return 0.0
+            last_trade_price = self.add_entry_fee(float(last_price_raw))
+            
             return (current_price - last_trade_price) / last_trade_price
         else:
             return 0.0
@@ -373,7 +393,16 @@ class BaseEnvironment(gym.Env):
             self._total_profit += pnl
 
     def current_price(self) -> float:
-        return self.prices.iloc[self._current_tick].open
+        price = self.prices.iloc[self._current_tick]
+        
+        if isinstance(price, pd.Series):
+            if price.empty:
+                raise ValueError(f"Price series is empty at tick {self._current_tick}. "
+                                 f"Prices DataFrame shape: {self.prices.shape}, "
+                                 f"Columns: {self.prices.columns}")
+            price = price.iloc[0]
+            
+        return float(price)
 
     def get_actions(self) -> type[Enum]:
         """

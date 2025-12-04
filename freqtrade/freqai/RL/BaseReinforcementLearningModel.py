@@ -334,6 +334,19 @@ class BaseReinforcementLearningModel(IFreqaiModel):
             if not prices_train_old.empty:
                 prices_train = prices_train_old
                 rename_dict = rename_dict_old
+
+            if prices_train.empty:
+                raise OperationalException(
+                    "Reinforcement learning module didn't find the correct raw prices "
+                    "assigned in feature_engineering_standard(). "
+                    "Please assign them with:\n"
+                    'dataframe["%-raw_close"] = dataframe["close"]\n'
+                    'dataframe["%-raw_open"] = dataframe["open"]\n'
+                    'dataframe["%-raw_high"] = dataframe["high"]\n'
+                    'dataframe["%-raw_low"] = dataframe["low"]\n'
+                    "inside `feature_engineering_standard()"
+                )
+
             logger.warning(
                 "Reinforcement learning module didn't find the correct raw prices "
                 "assigned in feature_engineering_standard(). "
@@ -343,10 +356,6 @@ class BaseReinforcementLearningModel(IFreqaiModel):
                 'dataframe["%-raw_high"] = dataframe["high"]\n'
                 'dataframe["%-raw_low"] = dataframe["low"]\n'
                 "inside `feature_engineering_standard()"
-            )
-        elif prices_train.empty:
-            raise OperationalException(
-                "No prices found, please follow log warning instructions to correct the strategy."
             )
 
         prices_train.rename(columns=rename_dict, inplace=True)

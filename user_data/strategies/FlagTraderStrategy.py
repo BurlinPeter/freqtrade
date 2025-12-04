@@ -16,8 +16,8 @@ class FlagTraderStrategy(IStrategy):
 
     # 策略参数
     minimal_roi = {"0": 0.1, "240": -1}
-    stoploss = -0.05
-    timeframe = "5m"
+    stoploss = -0.10
+    timeframe = "1d"
 
     # 启用 FreqAI
     can_short = True
@@ -74,6 +74,13 @@ class FlagTraderStrategy(IStrategy):
         # 小时和星期几(有助于模型学习市场的时间规律)
         dataframe["%-hour"] = dataframe["date"].dt.hour
         dataframe["%-dayofweek"] = dataframe["date"].dt.dayofweek
+
+        # 必须添加以下价格列供 RL 环境使用
+        dataframe["%-raw_close"] = dataframe["close"]
+        dataframe["%-raw_open"] = dataframe["open"]
+        dataframe["%-raw_high"] = dataframe["high"]
+        dataframe["%-raw_low"] = dataframe["low"]
+
         return dataframe
 
     # --------------------------------------

@@ -963,7 +963,9 @@ class FreqaiDataKitchen:
         :param config: Configuration dictionary
         """
         freqai_config: dict[str, Any] = config["freqai"]
-        return Path(config["user_data_dir"] / "models" / str(freqai_config.get("identifier")))
+        # Ensure user_data_dir is a Path object
+        user_data_dir = Path(config["user_data_dir"])
+        return Path(user_data_dir / "models" / str(freqai_config.get("identifier")))
 
     def remove_special_chars_from_feature_names(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         """

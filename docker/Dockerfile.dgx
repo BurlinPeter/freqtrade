@@ -1,0 +1,33 @@
+# 使用 NVIDIA NGC 的高性能镜像作为底座 (针对 DGX/Blackwell 架构优化)
+FROM nvcr.io/nvidia/pytorch:25.09-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /freqtrade
+
+# 1. 安装 Freqtrade 必须的系统库
+RUN apt-get update && apt-get install -y \
+    libatlas3-base sqlite3 git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. 复制 Freqtrade 依赖文件
+COPY requirements.txt requirements-freqai.txt requirements-freqai-rl.txt requirements-plot.txt ./
+
+# 3. 处理依赖: 移除 requirements 文件中对 torch 的强制版本限制
+# 我们希望使用 NGC 镜像自带的优化版 PyTorch，而不是 pip 重新下载的通用版
+RUN sed -i '/torch==/d' requirements-freqai-rl.txt
+
+# 4. 安装 Python 依赖
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -r requirements-plot.txt \
+    && pip install --no-cache-dir -r requirements-freqai.txt \
+    && pip install --no-cache-dir -r requirements-freqai-rl.txt \
+    && pip install --no-cache-dir transformers peft accelerate bitsandbytes
+
+# 5. 复制源码并安装 Freqtrade
+COPY . .
+RUN pip install -e .
+
+# 6. 设置入口
+ENTRYPOINT ["freqtrade"]
+CMD ["trade"]
+

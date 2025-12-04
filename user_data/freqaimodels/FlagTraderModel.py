@@ -17,6 +17,11 @@ from freqtrade.freqai.RL.Base5ActionRLEnv import Actions, Positions
 
 logger = logging.getLogger(__name__)
 
+# Global cache for LLM to prevent memory explosion
+_CACHED_LLM = None
+_CACHED_TOKENIZER = None
+_CACHED_MODEL_PATH = None
+
 # Try importing transformers and peft
 try:
     from peft import LoraConfig, TaskType, get_peft_model
@@ -49,48 +54,63 @@ class LLMFeatureExtractor(BaseFeaturesExtractor):
         self.feature_names = feature_names
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
-        logger.info(f"Loading LLM from {model_path}...")
+        # Use global cache
+        global _CACHED_LLM, _CACHED_TOKENIZER, _CACHED_MODEL_PATH
 
-        # Load Tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Check if we can reuse the cached model
+        if _CACHED_LLM is not None and _CACHED_MODEL_PATH == model_path:
+            logger.info(f"Reusing cached LLM from {model_path}...")
+            self.tokenizer = _CACHED_TOKENIZER
+            self.llm = _CACHED_LLM
+        else:
+            logger.info(f"Loading LLM from {model_path}...")
 
-        # Load Model
-        # optimizing for memory if possible
-        bnb_config = None
-        if th.cuda.is_available():
-            try:
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=th.float16,
-                )
-            except Exception as e:
-                logger.warning(f"Could not configure BitsAndBytes: {e}")
+            # Load Tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            quantization_config=bnb_config if bnb_config else None,
-            torch_dtype=th.float16 if th.cuda.is_available() else th.float32,
-            device_map="auto" if th.cuda.is_available() else None,
-            local_files_only=True
-        )
+            # Load Model
+            # optimizing for memory if possible
+            bnb_config = None
+            if th.cuda.is_available():
+                try:
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=th.float16,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not configure BitsAndBytes: {e}")
 
-        # Enable PEFT (LoRA)
-        if use_peft:
-            logger.info("Applying PEFT (LoRA) to LLM...")
-            peft_config = LoraConfig(
-                task_type=TaskType.FEATURE_EXTRACTION,  # Or CAUSAL_LM, but we use hidden states
-                inference_mode=False,
-                r=8,
-                lora_alpha=32,
-                lora_dropout=0.1
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                quantization_config=bnb_config if bnb_config else None,
+                torch_dtype=th.float16 if th.cuda.is_available() else th.float32,
+                device_map="auto" if th.cuda.is_available() else None,
+                local_files_only=True
             )
-            # We need to make sure we can get hidden states.
-            # TaskType.FEATURE_EXTRACTION might be safer or just generic LoRA.
-            self.llm = get_peft_model(self.llm, peft_config)
-            self.llm.print_trainable_parameters()
+
+            # Enable PEFT (LoRA)
+            if use_peft:
+                logger.info("Applying PEFT (LoRA) to LLM...")
+                peft_config = LoraConfig(
+                    task_type=TaskType.FEATURE_EXTRACTION,  # Or CAUSAL_LM, but we use hidden states
+                    inference_mode=False,
+                    r=8,
+                    lora_alpha=32,
+                    lora_dropout=0.1,
+                    init_lora_weights="gaussian"  # Use standard gaussian init instead of failing orthogonal
+                )
+                # We need to make sure we can get hidden states.
+                # TaskType.FEATURE_EXTRACTION might be safer or just generic LoRA.
+                self.llm = get_peft_model(self.llm, peft_config)
+                self.llm.print_trainable_parameters()
+            
+            # Update Cache
+            _CACHED_LLM = self.llm
+            _CACHED_TOKENIZER = self.tokenizer
+            _CACHED_MODEL_PATH = model_path
 
         # Update features_dim to match LLM hidden size
         if hasattr(self.llm.config, "hidden_size"):
@@ -116,6 +136,7 @@ class LLMFeatureExtractor(BaseFeaturesExtractor):
 
         # Forward pass
         # We want the last hidden state
+        # Ensure mixed precision compatibility (if model is float16, we don't need to cast, but output might need casting)
         outputs = self.llm(**inputs, output_hidden_states=True)
 
         # Get the last hidden state of the last token
@@ -133,8 +154,11 @@ class LLMFeatureExtractor(BaseFeaturesExtractor):
                 th.arange(last_hidden_state.shape[0], device=self.device),
                 last_token_indices
             ]
-
-        return embedding
+        
+        # CRITICAL FIX: Cast embedding to float32 before returning
+        # PPO's policy network expects float32, but LLM (loaded in 4bit/8bit/half) returns float16.
+        # This mismatch causes "RuntimeError: mat1 and mat2 must have the same dtype"
+        return embedding.to(dtype=th.float32)
 
     def _observations_to_prompts(self, observations: th.Tensor) -> list[str]:
         """
@@ -159,9 +183,33 @@ class LLMFeatureExtractor(BaseFeaturesExtractor):
                 for j, val in enumerate(obs_row):
                     if j < len(self.feature_names):
                         name = self.feature_names[j]
-                        features_text.append(f"{name}: {val:.4f}")
+                        
+                        # Handle potential numpy/tensor types safely
+                        val_float = 0.0
+                        try:
+                            if hasattr(val, 'item'):
+                                val_float = float(val.item())
+                            else:
+                                val_float = float(val)
+                        except (TypeError, ValueError):
+                            # Fallback for unexpected array shapes, take the first element
+                            if hasattr(val, '__getitem__') and len(val) > 0:
+                                val_float = float(val[0])
+                        
+                        features_text.append(f"{name}: {val_float:.4f}")
             else:
-                features_text = [f"Feature_{j}: {val:.4f}" for j, val in enumerate(obs_row)]
+                # Similar safe handling for the else block
+                for j, val in enumerate(obs_row):
+                    val_float = 0.0
+                    try:
+                        if hasattr(val, 'item'):
+                            val_float = float(val.item())
+                        else:
+                            val_float = float(val)
+                    except (TypeError, ValueError):
+                        if hasattr(val, '__getitem__') and len(val) > 0:
+                            val_float = float(val[0])
+                    features_text.append(f"Feature_{j}: {val_float:.4f}")
 
             state_str = ", ".join(features_text)
 
@@ -194,6 +242,24 @@ class LLMActorCriticPolicy(ActorCriticPolicy):
             features_extractor_kwargs=features_extractor_kwargs,
             **kwargs
         )
+    
+    def init_weights(self, module, gain=1.0):
+        """
+        Override weight initialization to be compatible with 8-bit quantized modules.
+        Stable Baselines3 default init uses orthogonal_, which fails on ByteTensor (int8) AND HalfTensor (float16).
+        We skip init for ANY layer that isn't standard float32 or has incompatible types.
+        """
+        # Skip if module has no weight attribute
+        if not hasattr(module, "weight"):
+            return
+            
+        # Skip initialization for quantized layers (uint8) or Half precision layers (float16)
+        # "geqrf_cuda" not implemented for 'Half' is the error for float16
+        if module.weight.dtype in [th.uint8, th.int8, th.float16, th.bfloat16]:
+             return
+        
+        # For other layers (standard float32), fall back to standard SB3 init
+        super().init_weights(module, gain)
 
 
 class FlagTraderModel(ReinforcementLearner):
