@@ -120,17 +120,42 @@ class PandasToNumpyGymWrapper(gym.Wrapper):
     """
     Wrapper to ensure observations are numpy arrays instead of Pandas DataFrame/Series.
     FreqAI environments typically return Pandas objects, which TorchRL hates.
+
+    Also flattens 2D observations (window_size, features) to 1D (window_size * features)
+    because TorchRL's GymWrapper doesn't handle 2D observations correctly.
     """
+
+    def __init__(self, env):
+        super().__init__(env)
+        # Update observation space to be 1D (flattened)
+        orig_shape = env.observation_space.shape
+        if len(orig_shape) == 2:
+            # (window_size, features) -> (window_size * features,)
+            flat_size = orig_shape[0] * orig_shape[1]
+            self.observation_space = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(flat_size,),
+                dtype=np.float32,
+            )
+            self._flatten = True
+        else:
+            self._flatten = False
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         if isinstance(obs, (pd.DataFrame, pd.Series)):
             obs = obs.values.astype(np.float32)
+        if self._flatten and obs.ndim > 1:
+            obs = obs.flatten()
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         if isinstance(obs, (pd.DataFrame, pd.Series)):
             obs = obs.values.astype(np.float32)
+        if self._flatten and obs.ndim > 1:
+            obs = obs.flatten()
         return obs, reward, terminated, truncated, info
 
 
@@ -222,13 +247,15 @@ class TorchReinforcementLearner(ReinforcementLearner):
             del self.model
             self.model = None
         
-        # Release LLM backbone from previous training (forces reload but frees memory)
+        # Release backbone from previous training (forces reload but frees memory)
+        if hasattr(self, 'backbone') and self.backbone is not None:
+            del self.backbone
+            self.backbone = None
+        
+        # Also clean up llm_backbone if it exists (for LLM-based subclasses)
         if hasattr(self, 'llm_backbone') and self.llm_backbone is not None:
             del self.llm_backbone
             self.llm_backbone = None
-        
-        # NOTE: Global LLM cache has been disabled in FlagTraderTorchRL.
-        # Memory cleanup is handled by deleting self.llm_backbone above.
         
         gc.collect()
         if th.cuda.is_available():
