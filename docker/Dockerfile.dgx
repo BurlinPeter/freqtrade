@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -r requirements-plot.txt \
     && pip install --no-cache-dir -r requirements-freqai.txt \
     && pip install --no-cache-dir -r requirements-freqai-rl.txt \
-    && pip install --no-cache-dir transformers peft accelerate bitsandbytes
+    && pip install --no-cache-dir transformers peft accelerate bitsandbytes torchrl tensordict
 
 # 5. 复制源码并安装 Freqtrade
 COPY . .
