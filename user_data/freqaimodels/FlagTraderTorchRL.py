@@ -11,14 +11,13 @@ import torch.nn as nn
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torch.distributions import Categorical
-from torchrl.collectors import SyncDataCollector
-from torchrl.data import LazyTensorStorage, ReplayBuffer
-from torchrl.envs import Compose, GymWrapper, StepCounter, TransformedEnv
+from torchrl.data import DiscreteTensorSpec
 from torchrl.modules import ProbabilisticActor, ValueOperator
 from torchrl.objectives import ClipPPOLoss
-from torchrl.objectives.value import GAE
 
 from freqtrade.freqai.prediction_models.ReinforcementLearner import ReinforcementLearner
+from freqtrade.freqai.RL.Base5ActionRLEnv import Actions, Positions
+
 
 # ============================================================
 # 内存限制: 使用简单 MLP 后, 12GB 绰绰有余
@@ -75,6 +74,11 @@ class FlattenObsGymWrapper(gym.Wrapper):
         return self._process_obs(obs), info
 
     def step(self, action):
+        # TorchRL passes tensor actions - convert to int here at the wrapper level
+        if hasattr(action, 'item'):
+            action = action.item()
+        action = int(action)
+
         obs, reward, terminated, truncated, info = self.env.step(action)
         return self._process_obs(obs), reward, terminated, truncated, info
 
@@ -199,9 +203,84 @@ class FlagTraderTorchRL(ReinforcementLearner):
         self.model = None
         self.window_size = self.rl_config.get("window_size", 10)
 
-    def fit(self, data_dictionary, dk, **kwargs):
-        """Train the agent using TorchRL PPO."""
-        # Memory cleanup
+    class MyRLEnv(ReinforcementLearner.MyRLEnv):
+        """
+        Custom Environment for FlagTraderTorchRL with PnL-driven rewards.
+        Reward shaping designed for better learning signals.
+        """
+
+        # Reward constants
+        INVALID_ACTION_PENALTY = -2.0
+        EXIT_PROFIT_BASE = 10.0
+        EXIT_PROFIT_MULTIPLIER = 100
+        EXIT_LOSS_BASE = -1.0
+        EXIT_LOSS_MULTIPLIER = 50
+        ENTRY_REWARD = 1.0
+        HOLD_NEUTRAL_PENALTY = -0.5
+        HOLD_PROFIT_BASE = 0.5
+        HOLD_PROFIT_MULTIPLIER = 20
+        HOLD_LOSS_BASE = -0.1
+        HOLD_LOSS_MULTIPLIER = 10
+
+        def step(self, action):
+            """Override step to ensure action is converted to int for TorchRL compatibility."""
+            if hasattr(action, 'item'):
+                action = action.item()
+            action = int(action)
+            return super().step(action)
+
+        def _get_exit_reward(self, current_pnl: float) -> float:
+            """Calculate reward for exit actions based on PnL."""
+            if current_pnl > 0:
+                return self.EXIT_PROFIT_BASE + current_pnl * self.EXIT_PROFIT_MULTIPLIER
+            return self.EXIT_LOSS_BASE + current_pnl * self.EXIT_LOSS_MULTIPLIER
+
+        def _get_hold_reward(self, current_pnl: float) -> float:
+            """Calculate reward for holding a position."""
+            if current_pnl > 0:
+                return self.HOLD_PROFIT_BASE + current_pnl * self.HOLD_PROFIT_MULTIPLIER
+            return self.HOLD_LOSS_BASE + current_pnl * self.HOLD_LOSS_MULTIPLIER
+
+        def calculate_reward(self, action: int) -> float:
+            """Reward function with balanced positive/negative signals."""
+            if hasattr(action, 'item'):
+                action = action.item()
+            action = int(action)
+
+            if not self._is_valid(action):
+                return self.INVALID_ACTION_PENALTY
+
+            current_pnl = self.get_unrealized_profit()
+
+            # EXIT Actions
+            if action == Actions.Long_exit.value:
+                if self._position == Positions.Long:
+                    return self._get_exit_reward(current_pnl)
+                return self.INVALID_ACTION_PENALTY
+
+            if action == Actions.Short_exit.value:
+                if self._position == Positions.Short:
+                    return self._get_exit_reward(current_pnl)
+                return self.INVALID_ACTION_PENALTY
+
+            # ENTRY Actions
+            if action == Actions.Long_enter.value:
+                if self._position == Positions.Neutral:
+                    return self.ENTRY_REWARD
+                return self.INVALID_ACTION_PENALTY
+
+            if action == Actions.Short_enter.value:
+                if self._position == Positions.Neutral:
+                    return self.ENTRY_REWARD
+                return self.INVALID_ACTION_PENALTY
+
+            # NEUTRAL / HOLD
+            if self._position == Positions.Neutral:
+                return self.HOLD_NEUTRAL_PENALTY
+            return self._get_hold_reward(current_pnl)
+
+    def _cleanup_memory(self) -> None:
+        """Clean up previous model and free GPU memory."""
         if hasattr(self, "model") and self.model is not None:
             del self.model
             self.model = None
@@ -214,45 +293,10 @@ class FlagTraderTorchRL(ReinforcementLearner):
             th.cuda.empty_cache()
             logger.info(f"GPU memory at fit() start: {th.cuda.memory_allocated() / 1e9:.2f} GB")
 
-        # 1. Prepare data
-        train_df = data_dictionary["train_features"]
-        total_timesteps = self.freqai_info["rl_config"]["train_cycles"] * len(train_df)
-
-        prices_train, prices_test = self.build_ohlc_price_dataframes(
-            dk.data_dictionary, dk.pair, dk
-        )
-
-        self.df_raw = copy.deepcopy(train_df)
-        self.set_train_and_eval_environments(
-            data_dictionary, prices_train, prices_test, dk
-        )
-
-        device = th.device("cuda" if th.cuda.is_available() else "cpu")
-
-        # 2. Create env_maker with our custom wrapper
-        def env_maker():
-            env_info = self.pack_env_dict(dk.pair)
-            gym_env = self.MyRLEnv(df=train_df, prices=prices_train, **env_info)
-            # Use our custom wrapper that flattens observations
-            gym_env = FlattenObsGymWrapper(gym_env)
-            return TransformedEnv(
-                GymWrapper(gym_env, device=device),
-                Compose(StepCounter(max_steps=len(train_df))),
-            )
-
-        # 3. Get observation and action dimensions from dummy env
-        dummy_env = env_maker()
-        action_spec = dummy_env.action_spec
-        output_dim = action_spec.space.n
-        # Get flattened observation dimension
-        obs_spec = dummy_env.observation_spec
-        obs_shape = obs_spec["observation"].shape
-        input_dim = obs_shape[-1]  # Flattened dimension
-        dummy_env.close()
-
-        logger.info(f"Observation dim: {input_dim}, Action dim: {output_dim}")
-
-        # 4. Build networks
+    def _build_networks(
+        self, input_dim: int, output_dim: int, device: th.device
+    ) -> tuple[ProbabilisticActor, ValueOperator, nn.Module]:
+        """Build actor and critic networks."""
         hidden_dim = self.rl_config.get("hidden_dim", 256)
         embedding_dim = self.rl_config.get("embedding_dim", 128)
 
@@ -263,108 +307,220 @@ class FlagTraderTorchRL(ReinforcementLearner):
         if th.cuda.is_available():
             logger.info(f"GPU memory after networks: {th.cuda.memory_allocated() / 1e6:.2f} MB")
 
-        # 5. Create TorchRL modules
         actor_module = TensorDictModule(
             actor_net, in_keys=["observation"], out_keys=["logits"]
         )
 
+        action_spec = DiscreteTensorSpec(n=output_dim, device=device)
+
         actor = ProbabilisticActor(
-            module=actor_module,
-            spec=action_spec,
-            in_keys=["logits"],
-            distribution_class=Categorical,
-            return_log_prob=True,
+            module=actor_module, spec=action_spec, in_keys=["logits"],
+            distribution_class=Categorical, return_log_prob=True,
         ).to(device)
 
         value_module = ValueOperator(
-            module=critic_net,
-            in_keys=["observation"],
+            module=critic_net, in_keys=["observation"],
         ).to(device)
 
-        # 6. Create collector and loss
-        frames_per_batch = self.rl_config.get("train_batch_size", 2048)
+        return actor, value_module, critic_net
 
-        collector = SyncDataCollector(
-            env_maker,
-            policy=actor,
-            frames_per_batch=frames_per_batch,
-            total_frames=total_timesteps,
-            split_trajs=False,
-            device=device,
+    def _collect_rollout(
+        self, gym_env, actor: ProbabilisticActor, value_module: ValueOperator,
+        frames_per_batch: int, device: th.device
+    ) -> dict:
+        """Collect rollout data from environment."""
+        obs_list, action_list, reward_list, done_list = [], [], [], []
+        logprob_list, value_list, next_obs_list = [], [], []
+
+        obs, _ = gym_env.reset()
+        obs_tensor = th.tensor(obs, dtype=th.float32, device=device).unsqueeze(0)
+
+        for _ in range(frames_per_batch):
+            with th.no_grad():
+                td_input = TensorDict({"observation": obs_tensor}, batch_size=[1])
+                td_output = actor(td_input)
+                action = td_output["action"].item()
+                logprob = td_output["action_log_prob"].item()
+                value = value_module(td_input)["state_value"].item()
+
+            next_obs, reward, terminated, truncated, _ = gym_env.step(action)
+            done = terminated or truncated
+
+            obs_list.append(obs)
+            next_obs_list.append(next_obs)
+            action_list.append(action)
+            reward_list.append(reward)
+            done_list.append(done)
+            logprob_list.append(logprob)
+            value_list.append(value)
+
+            obs = next_obs if not done else gym_env.reset()[0]
+            obs_tensor = th.tensor(obs, dtype=th.float32, device=device).unsqueeze(0)
+
+        return {
+            "obs": th.tensor(np.array(obs_list), dtype=th.float32, device=device),
+            "next_obs": th.tensor(np.array(next_obs_list), dtype=th.float32, device=device),
+            "action": th.tensor(action_list, dtype=th.long, device=device),
+            "reward": th.tensor(reward_list, dtype=th.float32, device=device),
+            "done": th.tensor(done_list, dtype=th.bool, device=device),
+            "logprob": th.tensor(logprob_list, dtype=th.float32, device=device),
+            "value": th.tensor(value_list, dtype=th.float32, device=device),
+        }
+
+    def _compute_gae(
+        self, rollout: dict, value_module: ValueOperator,
+        gamma: float, gae_lambda: float, device: th.device
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Compute Generalized Advantage Estimation."""
+        frames = rollout["obs"].shape[0]
+
+        with th.no_grad():
+            next_obs_td = TensorDict({"observation": rollout["next_obs"]}, batch_size=[frames])
+            next_values = value_module(next_obs_td)["state_value"].squeeze(-1)
+
+        advantages = th.zeros(frames, device=device)
+        returns = th.zeros(frames, device=device)
+        gae = 0.0
+
+        for t in reversed(range(frames)):
+            next_val = 0.0 if rollout["done"][t] else next_values[t].item()
+            delta = rollout["reward"][t] + gamma * next_val - rollout["value"][t]
+            gae = delta + gamma * gae_lambda * (1 - float(rollout["done"][t])) * gae
+            advantages[t] = gae
+            returns[t] = gae + rollout["value"][t]
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages, returns
+
+    def _ppo_update(
+        self, tensordict_data: TensorDict, loss_module: ClipPPOLoss,
+        optimizer: th.optim.Optimizer, ppo_epochs: int, mini_batch_size: int, device: th.device
+    ) -> None:
+        """Perform PPO optimization steps."""
+        frames = tensordict_data.batch_size[0]
+
+        for _ in range(ppo_epochs):
+            indices = th.randperm(frames, device=device)
+            for start in range(0, frames, mini_batch_size):
+                end = start + mini_batch_size
+                subdata = tensordict_data[indices[start:end]]
+
+                loss_vals = loss_module(subdata)
+                loss_value = (
+                    loss_vals["loss_objective"]
+                    + loss_vals["loss_critic"]
+                    + loss_vals["loss_entropy"]
+                )
+
+                optimizer.zero_grad()
+                loss_value.backward()
+                th.nn.utils.clip_grad_norm_(loss_module.parameters(), 0.5)
+                optimizer.step()
+
+    def fit(self, data_dictionary, dk, **kwargs):
+        """Train the agent using TorchRL PPO."""
+        self._cleanup_memory()
+
+        # Prepare data
+        train_df = data_dictionary["train_features"]
+        total_timesteps = self.freqai_info["rl_config"]["train_cycles"] * len(train_df)
+
+        prices_train, prices_test = self.build_ohlc_price_dataframes(
+            dk.data_dictionary, dk.pair, dk
         )
 
+        self.df_raw = copy.deepcopy(train_df)
+        self.set_train_and_eval_environments(data_dictionary, prices_train, prices_test, dk)
+
+        device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+        # Get dimensions from dummy env
+        env_info = self.pack_env_dict(dk.pair)
+        dummy_env = self.MyRLEnv(df=train_df, prices=prices_train, **env_info)
+        dummy_env = FlattenObsGymWrapper(dummy_env)
+        input_dim = dummy_env.observation_space.shape[0]
+        output_dim = dummy_env.action_space.n
+        dummy_env.close()
+
+        logger.info(f"Observation dim: {input_dim}, Action dim: {output_dim}")
+
+        # Build networks
+        actor, value_module, critic_net = self._build_networks(input_dim, output_dim, device)
+
+        # Setup training components
+        frames_per_batch = self.rl_config.get("train_batch_size", 2048)
+        entropy_coef = self.rl_config.get("entropy_coef", 0.05)
+
         loss_module = ClipPPOLoss(
-            actor_network=actor,
-            critic_network=value_module,
-            clip_epsilon=0.2,
-            entropy_bonus=True,
-            entropy_coef=0.001,
-            critic_coef=1.0,
+            actor_network=actor, critic_network=value_module, clip_epsilon=0.2,
+            entropy_bonus=True, entropy_coef=entropy_coef, critic_coef=1.0,
             loss_critic_type="l2",
         )
         loss_module.set_keys(advantage="advantage", value_target="value_target")
 
-        advantage_module = GAE(
-            gamma=0.99,
-            lmbda=0.95,
-            value_network=value_module,
-            average_gae=True,
-            vectorized=False,
-        )
-
         optimizer = th.optim.Adam(loss_module.parameters(), lr=3e-4)
 
-        replay_buffer = ReplayBuffer(
-            storage=LazyTensorStorage(max_size=frames_per_batch),
-            batch_size=self.rl_config.get("mini_batch_size", 64),
-        )
-
-        # 7. Training loop
-        logger.info("Starting TorchRL training...")
+        # Training loop
+        logger.info("Starting manual rollout training...")
         start_time = time.time()
 
-        for i, tensordict_data in enumerate(collector):
-            with th.no_grad():
-                advantage_module(tensordict_data)
+        ppo_epochs = self.rl_config.get("ppo_epochs", 10)
+        mini_batch_size = self.rl_config.get("mini_batch_size", 64)
+        num_batches = total_timesteps // frames_per_batch
 
-            data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
+        gym_env = self.MyRLEnv(df=train_df, prices=prices_train, **env_info)
+        gym_env = FlattenObsGymWrapper(gym_env)
 
-            ppo_epochs = self.rl_config.get("ppo_epochs", 10)
-            mini_batch_size = self.rl_config.get("mini_batch_size", 64)
+        for batch_idx in range(num_batches):
+            rollout = self._collect_rollout(gym_env, actor, value_module, frames_per_batch, device)
+            advantages, returns = self._compute_gae(rollout, value_module, 0.99, 0.95, device)
 
-            for _ in range(ppo_epochs):
-                for _ in range(frames_per_batch // mini_batch_size):
-                    subdata = replay_buffer.sample()
-                    loss_vals = loss_module(subdata.to(device))
-                    loss_value = (
-                        loss_vals["loss_objective"]
-                        + loss_vals["loss_critic"]
-                        + loss_vals["loss_entropy"]
-                    )
+            tensordict_data = TensorDict({
+                "observation": rollout["obs"],
+                "action": rollout["action"],
+                "action_log_prob": rollout["logprob"],
+                "state_value": rollout["value"].unsqueeze(-1),
+                "advantage": advantages.unsqueeze(-1),
+                "value_target": returns.unsqueeze(-1),
+            }, batch_size=[frames_per_batch])
 
-                    optimizer.zero_grad()
-                    loss_value.backward()
-                    optimizer.step()
+            self._ppo_update(
+                tensordict_data, loss_module, optimizer, ppo_epochs, mini_batch_size, device
+            )
 
-            if i % 10 == 0:
-                avg_reward = tensordict_data["next", "reward"].mean().item()
-                logger.info(f"Batch {i}, Avg Reward: {avg_reward:.4f}")
+            if batch_idx % 5 == 0:
+                self._log_training_progress(batch_idx, rollout["reward"], rollout["action"])
 
+        gym_env.close()
         logger.info(f"Training finished in {time.time() - start_time:.2f}s")
 
         self.model = actor
 
         # Cleanup
-        del collector, loss_module, advantage_module, optimizer, replay_buffer
-        del value_module, critic_net
-
+        del loss_module, optimizer, value_module, critic_net
         gc.collect()
         if th.cuda.is_available():
             th.cuda.empty_cache()
             logger.info(f"GPU memory after cleanup: {th.cuda.memory_allocated() / 1e9:.2f} GB")
 
         return actor
+
+    def _log_training_progress(
+        self, batch_idx: int, reward_t: th.Tensor, action_t: th.Tensor
+    ) -> None:
+        """Log training progress."""
+        avg_reward = reward_t.mean().item()
+        action_counts = [(action_t == a).sum().item() for a in range(5)]
+        action_names = ["N", "LE", "LX", "SE", "SX"]
+        action_dist = ", ".join(
+            f"{n}:{c}" for n, c in zip(action_names, action_counts, strict=True)
+        )
+        r_pos = (reward_t > 0).sum().item()
+        r_neg = (reward_t < 0).sum().item()
+        logger.info(
+            f"Batch {batch_idx}, Reward: {avg_reward:.4f} "
+            f"(+:{r_pos}, -:{r_neg}), Actions: [{action_dist}]"
+        )
 
     def predict(self, unfiltered_df, dk, **kwargs):
         """Run inference using the trained TorchRL model."""

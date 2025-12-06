@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -15,12 +16,10 @@ from tensordict.nn import TensorDictModule
 from torch.distributions import Categorical
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyTensorStorage, ReplayBuffer
-from torchrl.envs import Compose, GymWrapper, StepCounter, TransformedEnv
+from torchrl.envs import Compose, GymWrapper, ObservationTransform, StepCounter, TransformedEnv
 from torchrl.modules import ProbabilisticActor, ValueOperator
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
-from torchrl.envs import ObservationTransform
-import gymnasium as gym
 
 from freqtrade.freqai.data_kitchen import FreqaiDataKitchen
 from freqtrade.freqai.prediction_models.ReinforcementLearner import ReinforcementLearner
@@ -39,16 +38,16 @@ class LLMTokenizerTransform(ObservationTransform):
         self.tokenizer = tokenizer
         self.prompt_func = prompt_func
         self.max_length = max_length
-    
+
     def transform_observation_spec(self, observation_spec):
         """Update the observation spec to reflect tokenized output shape."""
         from torchrl.data import Bounded, Composite
-        
+
         # observation_spec is a Composite containing "observation" key
         # We need to replace the "observation" spec with the tokenized version
         vocab_size = self.tokenizer.vocab_size if hasattr(self.tokenizer, 'vocab_size') else 50000
         device = observation_spec.device if hasattr(observation_spec, 'device') else 'cpu'
-        
+
         new_obs_spec = Bounded(
             low=0,
             high=vocab_size,
@@ -56,7 +55,7 @@ class LLMTokenizerTransform(ObservationTransform):
             dtype=th.int64,
             device=device,
         )
-        
+
         # Return a new Composite with the updated observation spec
         return Composite(
             observation=new_obs_spec,
@@ -82,9 +81,9 @@ class LLMTokenizerTransform(ObservationTransform):
             squeeze = True
         else:
             squeeze = False
-            
+
         prompts = self.prompt_func(obs_np)
-        
+
         tokens = self.tokenizer(
             prompts,
             return_tensors="pt",
@@ -92,27 +91,27 @@ class LLMTokenizerTransform(ObservationTransform):
             truncation=True,
             max_length=self.max_length
         )
-        
+
         input_ids = tokens["input_ids"] # (Batch, VarLen)
 
         # Aggressive Manual Padding / Truncation by pre-allocating tensor
         batch_size, seq_len = input_ids.shape
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        
+
         final_input_ids = th.full(
-            (batch_size, self.max_length), 
-            pad_id, 
+            (batch_size, self.max_length),
+            pad_id,
             dtype=input_ids.dtype,
             device=input_ids.device
         )
-        
+
         # Copy valid tokens
         valid_len = min(seq_len, self.max_length)
         final_input_ids[:, :valid_len] = input_ids[:, :valid_len]
-        
+
         if squeeze:
             final_input_ids = final_input_ids.squeeze(0)
-            
+
         return final_input_ids.to(obs.device)
 
 
@@ -169,29 +168,29 @@ class TokenizingGymWrapper(gym.Wrapper):
         self.tokenizer = tokenizer
         self.prompt_func = prompt_func
         self.max_length = max_length
-        
+
         # Update observation space to reflect tokenized output
         vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50000
         self.observation_space = gym.spaces.Box(
             low=0, high=vocab_size, shape=(max_length,), dtype=np.int64
         )
-    
+
     def _tokenize_obs(self, obs):
         """Convert observation to tokenized input_ids."""
         # Ensure obs is numpy array
         if isinstance(obs, (pd.DataFrame, pd.Series)):
             obs = obs.values.astype(np.float32)
-        
+
         # Handle 1D obs (single sample)
         if obs.ndim == 1:
             obs = obs[None, :]
             squeeze = True
         else:
             squeeze = False
-        
+
         # Generate prompts
         prompts = self.prompt_func(obs)
-        
+
         # Tokenize
         tokens = self.tokenizer(
             prompts,
@@ -200,27 +199,27 @@ class TokenizingGymWrapper(gym.Wrapper):
             truncation=True,
             max_length=self.max_length
         )
-        
+
         input_ids = tokens["input_ids"]
-        
+
         # Pad to fixed length
         batch_size, seq_len = input_ids.shape
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        
+
         final_ids = np.full((batch_size, self.max_length), pad_id, dtype=np.int64)
         valid_len = min(seq_len, self.max_length)
         final_ids[:, :valid_len] = input_ids[:, :valid_len]
-        
+
         if squeeze:
             final_ids = final_ids.squeeze(0)
-        
+
         return final_ids
-    
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         tokenized_obs = self._tokenize_obs(obs)
         return tokenized_obs, info
-    
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         tokenized_obs = self._tokenize_obs(obs)
@@ -234,116 +233,53 @@ class TorchReinforcementLearner(ReinforcementLearner):
     but overrides fit() and predict() to use TorchRL instead of Stable-Baselines3.
     """
 
-    def fit(self, data_dictionary: dict[str, Any], dk: FreqaiDataKitchen, **kwargs):
-        """
-        Train the agent using TorchRL PPO.
-        """
-        # CRITICAL: Release previous model and LLM backbone to free GPU memory
-        # FreqAI backtesting trains multiple models, memory accumulates without proper cleanup
+    def _cleanup_previous_model(self) -> None:
+        """Release previous model and LLM backbone to free GPU memory."""
         import gc
-        
-        # Release previous model if exists
+
         if hasattr(self, 'model') and self.model is not None:
             del self.model
             self.model = None
-        
-        # Release backbone from previous training (forces reload but frees memory)
+
         if hasattr(self, 'backbone') and self.backbone is not None:
             del self.backbone
             self.backbone = None
-        
-        # Also clean up llm_backbone if it exists (for LLM-based subclasses)
+
         if hasattr(self, 'llm_backbone') and self.llm_backbone is not None:
             del self.llm_backbone
             self.llm_backbone = None
-        
+
         gc.collect()
         if th.cuda.is_available():
             th.cuda.empty_cache()
-            logger.info(f"GPU memory at fit() start (after cleanup): {th.cuda.memory_allocated() / 1e9:.2f} GB")
-        
-        # 1. Prepare data and environment (reusing parent class logic)
-        train_df = data_dictionary["train_features"]
-        total_timesteps = self.freqai_info["rl_config"]["train_cycles"] * len(train_df)
+            mem_gb = th.cuda.memory_allocated() / 1e9
+            logger.info(f"GPU memory at fit() start (after cleanup): {mem_gb:.2f} GB")
 
-        # Prepare price dataframes for the environment
-        prices_train, prices_test = self.build_ohlc_price_dataframes(
-            dk.data_dictionary, dk.pair, dk
-        )
-
-        # Set up environments (this populates self.train_env and self.eval_env)
-        # We need to pass the data dictionaries as expected by parent
-        # Re-making strictly for env setup if needed, but we have data_dictionary
-        # Re-making strictly for env setup if needed, but we have data_dictionary
-        _ = dk.make_train_test_datasets(train_df, data_dictionary["train_labels"])
-        # Actually, fit() in parent does some pipeline stuff.
-        # We should probably call parent's setup logic or replicate it.
-        # For simplicity, let's assume data_dictionary passed here is ready
-        # or we replicate the minimal setup.
-
-        # Replicate essential setup from ReinforcementLearner.fit without calling it
-        # (to avoid SB3 logic)
-        self.df_raw = copy.deepcopy(train_df)
-        self.set_train_and_eval_environments(
-            data_dictionary, prices_train, prices_test, dk
-        )
-
-        # 2. Wrap Gym Env for TorchRL
-        # TorchRL needs a constructor function or a wrapped env
-        # self.train_env is a Gym env (or VecEnv). TorchRL prefers its own wrappers.
-        # For simplicity in this example, we wrap the single env.
-        # Note: SB3 VecEnv might not be directly compatible, better to use the raw
-        # MyRLEnv class if possible.
-        # But self.train_env is already instantiated. Let's try to wrap it.
-
-        device = th.device("cuda" if th.cuda.is_available() else "cpu")
-
-        # Pre-fetch tokenizer and prompt function ONCE in main process
-        # to avoid reloading LLM in each subprocess
-        input_dim = train_df.shape[1]
-        use_llm_tokenizer = hasattr(self, "_get_llm_backbone")
-        if use_llm_tokenizer:
-            backbone = self._get_llm_backbone(input_dim)
-            tokenizer = backbone.tokenizer
-            prompt_func = backbone.manual_observations_to_prompts
-        else:
-            tokenizer = None
-            prompt_func = None
-
-        # Define the creation function for the collector
-        # NOTE: tokenizer/prompt_func are captured from outer scope, not re-created
+    def _create_env_maker(
+        self, train_df: DataFrame, prices_train: DataFrame, dk: FreqaiDataKitchen,
+        device: th.device, tokenizer: Any, prompt_func: Any, use_llm_tokenizer: bool
+    ):
+        """Create environment factory function for TorchRL collector."""
         def env_maker():
-            # We create a fresh instance to avoid issues with existing SB3 wrappers if any
             env_info = self.pack_env_dict(dk.pair)
             gym_env = self.MyRLEnv(df=train_df, prices=prices_train, **env_info)
-            # Wrap to convert Pandas obs to Numpy
             gym_env = PandasToNumpyGymWrapper(gym_env)
-            
+
             if use_llm_tokenizer:
-                # Tokenize at Gym level for consistent observation shapes
-                # tokenizer/prompt_func are from outer scope (main process)
                 gym_env = TokenizingGymWrapper(gym_env, tokenizer, prompt_func)
-            
+
             return TransformedEnv(
                 GymWrapper(gym_env, device=device),
                 Compose(StepCounter(max_steps=len(train_df)))
             )
+        return env_maker
 
-        # 3. Define Network Architecture
-        # We need a way to determine output_dim from the instantiated env
-        dummy_env = env_maker()
-        action_spec = dummy_env.action_spec
-        output_dim = action_spec.space.n
-        dummy_env.close()
-        
-        # input_dim is already defined above (train_df.shape[1])
-
-        # Define Actor (Policy)
-        # Simple MLP for example. User can override _build_net
+    def _build_actor_critic(
+        self, input_dim: int, output_dim: int, action_spec: Any, device: th.device
+    ) -> tuple[ProbabilisticActor, ValueOperator, nn.Module]:
+        """Build actor and critic networks for PPO."""
         net = self._build_net(input_dim, output_dim).to(device)
 
-        # Actor Module
-        # We assume discrete actions for now (Categorical)
         actor_module = TensorDictModule(
             net, in_keys=["observation"], out_keys=["logits"]
         )
@@ -356,65 +292,33 @@ class TorchReinforcementLearner(ReinforcementLearner):
             return_log_prob=True,
         ).to(device)
 
-        # Define Critic (Value)
         value_net = self._build_value_net(input_dim).to(device)
         value_module = ValueOperator(
             module=value_net,
             in_keys=["observation"],
         ).to(device)
 
-        # 4. Define Collector and Loss
-        frames_per_batch = self.rl_config.get("train_batch_size", 2048)
+        return actor, value_module, value_net
 
-        collector = SyncDataCollector(
-            env_maker,
-            policy=actor,
-            frames_per_batch=frames_per_batch,
-            total_frames=total_timesteps,
-            split_trajs=False,
-            device=device,
-        )
-
-        loss_module = ClipPPOLoss(
-            actor_network=actor,
-            critic_network=value_module,
-            clip_epsilon=0.2,
-            entropy_bonus=True,
-            entropy_coef=0.001,
-            critic_coef=1.0,
-            loss_critic_type="l2",
-        )
-        loss_module.set_keys(advantage="advantage", value_target="value_target")
-
-        advantage_module = GAE(
-            gamma=0.99, lmbda=0.95, value_network=value_module, average_gae=True,
-            vectorized=False,  # Disable vmap - required for LLM compatibility
-        )
-
-        optimizer = th.optim.Adam(loss_module.parameters(), lr=3e-4)
-
-        # Replay Buffer
-        replay_buffer = ReplayBuffer(
-            storage=LazyTensorStorage(max_size=frames_per_batch),
-            batch_size=self.rl_config.get("mini_batch_size", 64),
-        )
-
-        # 5. Training Loop
+    def _run_training_loop(
+        self, collector: SyncDataCollector, loss_module: ClipPPOLoss,
+        advantage_module: GAE, optimizer: th.optim.Optimizer,
+        replay_buffer: ReplayBuffer, frames_per_batch: int, device: th.device
+    ) -> None:
+        """Execute the PPO training loop."""
         logger.info("Starting TorchRL training...")
         start_time = time.time()
 
+        ppo_epochs = self.rl_config.get("ppo_epochs", 10)
+        mini_batch_size = self.rl_config.get("mini_batch_size", 64)
+
         for i, tensordict_data in enumerate(collector):
-            # Compute Advantage
             with th.no_grad():
                 advantage_module(tensordict_data)
 
-            # Update Replay Buffer
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
 
-            # Optimization steps (PPO epochs)
-            ppo_epochs = self.rl_config.get("ppo_epochs", 10)
-            mini_batch_size = self.rl_config.get("mini_batch_size", 64)
             for _ in range(ppo_epochs):
                 for _ in range(frames_per_batch // mini_batch_size):
                     subdata = replay_buffer.sample()
@@ -429,32 +333,104 @@ class TorchReinforcementLearner(ReinforcementLearner):
                     loss_value.backward()
                     optimizer.step()
 
-            # Logging
             if i % 10 == 0:
                 avg_reward = tensordict_data["next", "reward"].mean().item()
                 logger.info(f"Batch {i}, Avg Reward: {avg_reward:.4f}")
 
         logger.info(f"Training finished in {time.time() - start_time:.2f}s")
 
+    def fit(self, data_dictionary: dict[str, Any], dk: FreqaiDataKitchen, **kwargs):
+        """Train the agent using TorchRL PPO."""
+        self._cleanup_previous_model()
+
+        # Prepare data and environment
+        train_df = data_dictionary["train_features"]
+        total_timesteps = self.freqai_info["rl_config"]["train_cycles"] * len(train_df)
+
+        prices_train, prices_test = self.build_ohlc_price_dataframes(
+            dk.data_dictionary, dk.pair, dk
+        )
+
+        _ = dk.make_train_test_datasets(train_df, data_dictionary["train_labels"])
+        self.df_raw = copy.deepcopy(train_df)
+        self.set_train_and_eval_environments(
+            data_dictionary, prices_train, prices_test, dk
+        )
+
+        device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+        # Pre-fetch tokenizer and prompt function
+        input_dim = train_df.shape[1]
+        use_llm_tokenizer = hasattr(self, "_get_llm_backbone")
+        if use_llm_tokenizer:
+            backbone = self._get_llm_backbone(input_dim)
+            tokenizer = backbone.tokenizer
+            prompt_func = backbone.manual_observations_to_prompts
+        else:
+            tokenizer = None
+            prompt_func = None
+
+        # Create environment factory
+        env_maker = self._create_env_maker(
+            train_df, prices_train, dk, device, tokenizer, prompt_func, use_llm_tokenizer
+        )
+
+        # Get action dimensions from dummy env
+        dummy_env = env_maker()
+        action_spec = dummy_env.action_spec
+        output_dim = action_spec.space.n
+        dummy_env.close()
+
+        # Build networks
+        actor, value_module, value_net = self._build_actor_critic(
+            input_dim, output_dim, action_spec, device
+        )
+
+        # Setup training components
+        frames_per_batch = self.rl_config.get("train_batch_size", 2048)
+
+        collector = SyncDataCollector(
+            env_maker, policy=actor, frames_per_batch=frames_per_batch,
+            total_frames=total_timesteps, split_trajs=False, device=device,
+        )
+
+        loss_module = ClipPPOLoss(
+            actor_network=actor, critic_network=value_module, clip_epsilon=0.2,
+            entropy_bonus=True, entropy_coef=0.001, critic_coef=1.0,
+            loss_critic_type="l2",
+        )
+        loss_module.set_keys(advantage="advantage", value_target="value_target")
+
+        advantage_module = GAE(
+            gamma=0.99, lmbda=0.95, value_network=value_module,
+            average_gae=True, vectorized=False,
+        )
+
+        optimizer = th.optim.Adam(loss_module.parameters(), lr=3e-4)
+
+        replay_buffer = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=frames_per_batch),
+            batch_size=self.rl_config.get("mini_batch_size", 64),
+        )
+
+        # Run training
+        self._run_training_loop(
+            collector, loss_module, advantage_module, optimizer,
+            replay_buffer, frames_per_batch, device
+        )
+
         self.model = actor
-        
-        # CRITICAL: Clean up to prevent memory accumulation across multiple training windows
-        # FreqAI backtesting trains multiple models (sliding windows), so we must release memory
-        del collector
-        del loss_module
-        del advantage_module
-        del optimizer
-        del replay_buffer
-        del value_module
-        del value_net
-        
-        # Force garbage collection and CUDA cache cleanup
+
+        # Cleanup
+        del collector, loss_module, advantage_module, optimizer, replay_buffer
+        del value_module, value_net
+
         import gc
         gc.collect()
         if th.cuda.is_available():
             th.cuda.empty_cache()
             logger.info(f"GPU memory after cleanup: {th.cuda.memory_allocated() / 1e9:.2f} GB")
-        
+
         return actor
 
     def predict(
@@ -465,22 +441,24 @@ class TorchReinforcementLearner(ReinforcementLearner):
         """
         # Check if model is loaded
         if self.model is None:
-            logger.warning("Model not initialized in predict(). Attempting to load or rebuilding...")
+            logger.warning(
+                "Model not initialized in predict(). Attempting to load or rebuilding..."
+            )
             # Try to infer dims from data to rebuild net if needed, though load() is preferred.
             # If we are here, it means load() failed or wasn't called, and fit() wasn't called.
             # FreqAI flow: fit() -> predict() OR load() -> predict()
             # If load failed, we can't do much.
             # But we can try to be robust if it's just uninitialized architecture.
-            
-            # NOTE: We cannot easily rebuild without knowing if it was loaded. 
+
+            # NOTE: We cannot easily rebuild without knowing if it was loaded.
             # If it is None, we return zeros/neutral to avoid crash, or raise error.
             logger.error("Self.model is None. Returning neutral predictions.")
             return (
                 pd.DataFrame(
-                    np.zeros((len(unfiltered_df),)), 
+                    np.zeros((len(unfiltered_df),)),
                     columns=[self.rl_config.get("target_col", "trend")],
                     index=unfiltered_df.index
-                ), 
+                ),
                 np.zeros(len(unfiltered_df), dtype=int)
             )
 
@@ -512,10 +490,10 @@ class TorchReinforcementLearner(ReinforcementLearner):
             for i in range(0, len(input_data), batch_size):
                 chunk = input_data[i : i + batch_size]
                 obs_data = th.tensor(chunk, dtype=th.float32).to(device)
-                
+
                 input_td = TensorDict({"observation": obs_data}, batch_size=[len(obs_data)])
                 output_td = model(input_td)
-                
+
                 logits = output_td["logits"]
                 actions = logits.argmax(dim=-1).cpu().numpy()
                 all_actions.append(actions)
@@ -579,7 +557,7 @@ class TorchReinforcementLearner(ReinforcementLearner):
             if self.model is None:
                  logger.warning("Model structure not initialized. Cannot load weights.")
                  return
-            
+
             device = th.device("cuda" if th.cuda.is_available() else "cpu")
             state_dict = th.load(load_path, map_location=device)
             self.model.load_state_dict(state_dict)
