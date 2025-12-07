@@ -11,7 +11,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torch.distributions import Categorical
-from torchrl.data import DiscreteTensorSpec
+from torchrl.data import Categorical as CategoricalSpec
 from torchrl.modules import ProbabilisticActor, ValueOperator
 from torchrl.objectives import ClipPPOLoss
 
@@ -311,7 +311,7 @@ class FlagTraderTorchRL(ReinforcementLearner):
             actor_net, in_keys=["observation"], out_keys=["logits"]
         )
 
-        action_spec = DiscreteTensorSpec(n=output_dim, device=device)
+        action_spec = CategoricalSpec(n=output_dim, device=device)
 
         actor = ProbabilisticActor(
             module=actor_module, spec=action_spec, in_keys=["logits"],
@@ -453,7 +453,7 @@ class FlagTraderTorchRL(ReinforcementLearner):
 
         loss_module = ClipPPOLoss(
             actor_network=actor, critic_network=value_module, clip_epsilon=0.2,
-            entropy_bonus=True, entropy_coef=entropy_coef, critic_coef=1.0,
+            entropy_bonus=True, entropy_coeff=entropy_coef, critic_coeff=1.0,
             loss_critic_type="l2",
         )
         loss_module.set_keys(advantage="advantage", value_target="value_target")
@@ -523,18 +523,11 @@ class FlagTraderTorchRL(ReinforcementLearner):
         )
 
     def predict(self, unfiltered_df, dk, **kwargs):
-        """Run inference using the trained TorchRL model."""
-        if self.model is None:
-            logger.error("Model is None. Returning neutral predictions.")
-            return (
-                pd.DataFrame(
-                    np.zeros((len(unfiltered_df),)),
-                    columns=[self.rl_config.get("target_col", "trend")],
-                    index=unfiltered_df.index,
-                ),
-                np.zeros(len(unfiltered_df), dtype=int),
-            )
-
+        """
+        Run inference using the trained TorchRL model.
+        Uses parent class method for proper data handling, only overrides rl_model_predict.
+        """
+        # Use parent class predict which handles data pipeline correctly
         dk.find_features(unfiltered_df)
         filtered_dataframe, _ = dk.filter_features(
             unfiltered_df, dk.training_features_list, training_filter=False
@@ -547,28 +540,42 @@ class FlagTraderTorchRL(ReinforcementLearner):
             dk.data_dictionary["prediction_features"], outlier_check=True
         )
 
-        model = self.model
+        # Call our custom rl_model_predict
+        pred_df = self.rl_model_predict(
+            dk.data_dictionary["prediction_features"], dk, self.model
+        )
+        pred_df.fillna(0, inplace=True)
+
+        return (pred_df, dk.do_predict)
+
+    def rl_model_predict(self, dataframe, dk, model):
+        """
+        Custom RL model prediction using TorchRL.
+        This method is called by predict() for each prediction window.
+        """
+        if model is None:
+            logger.error("Model is None. Returning neutral predictions.")
+            return pd.DataFrame(
+                np.zeros(len(dataframe)),
+                columns=dk.label_list,
+                index=dataframe.index,
+            )
+
         device = th.device("cuda" if th.cuda.is_available() else "cpu")
         model.to(device)
         model.eval()
 
-        # Get flattened input dimension from model
-        input_dim = self.backbone.input_dim if self.backbone else None
-
         # Batch processing
         batch_size = self.rl_config.get("prediction_batch_size", 256)
-        raw_data = dk.data_dictionary["prediction_features"].values
+        raw_data = dataframe.values
         all_actions = []
 
         with th.no_grad():
             for i in range(0, len(raw_data), batch_size):
                 chunk = raw_data[i : i + batch_size]
-                # Flatten if needed (handle window data)
+                # Flatten if needed
                 if chunk.ndim > 2:
                     chunk = chunk.reshape(chunk.shape[0], -1)
-                elif chunk.ndim == 2 and input_dim and chunk.shape[1] != input_dim:
-                    # Data might already be single-row features, not windows
-                    pass
 
                 obs_data = th.tensor(chunk, dtype=th.float32).to(device)
                 input_td = TensorDict({"observation": obs_data}, batch_size=[len(obs_data)])
@@ -580,10 +587,17 @@ class FlagTraderTorchRL(ReinforcementLearner):
 
         actions = np.concatenate(all_actions)
 
+        # Debug: 打印 action 分布
+        unique, counts = np.unique(actions, return_counts=True)
+        action_dist = dict(zip(unique, counts, strict=False))
+        logger.info(f"Predict action distribution: {action_dist}")
+        logger.info(f"Total predictions: {len(actions)}, do_predict sum: {dk.do_predict.sum()}")
+
+        # Create prediction dataframe with correct index
         pred_df = pd.DataFrame(
             actions,
-            columns=[self.rl_config.get("target_col", "trend")],
-            index=filtered_dataframe.index,
+            columns=dk.label_list,
+            index=dataframe.index,
         )
 
-        return (pred_df, dk.do_predict)
+        return pred_df
