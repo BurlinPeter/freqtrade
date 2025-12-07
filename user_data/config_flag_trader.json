@@ -1,0 +1,106 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "max_open_trades": 1,
+    "stake_currency": "USDT",
+    "stake_amount": 100,
+    "tradable_balance_ratio": 1,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "timeframe": "1d",
+    "cancel_open_orders_on_exit": true,
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 30
+    },
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [
+            "BTC/USDT:USDT"
+        ],
+        "pair_blacklist": []
+    },
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+    "exit_pricing": {
+        "price_side": "other",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "freqai": {
+        "enabled": true,
+        "purge_old_models": 2,
+        "train_period_days": 1000,
+        "backtest_period_days": 60,
+        "live_retrain_hours": 0,
+        "identifier": "flag-trader-v1",
+        "feature_parameters": {
+            "include_timeframes": [
+                "1d"
+            ],
+            "include_corr_pairlist": [],
+            "label_period_candles": 20,
+            "include_shifted_candles": 2,
+            "weight_factor": 0.9,
+            "principal_component_analysis": false,
+            "use_SVM_to_remove_outliers": false,
+            "indicator_periods_candles": [
+                10,
+                20
+            ],
+            "plot_feature_importances": 0
+        },
+        "data_split_parameters": {
+            "test_size": 0.2,
+            "random_state": 1
+        },
+        "rl_config": {
+            "train_cycles": 50,
+            "add_state_info": false,
+            "max_trade_duration_candles": 300,
+            "max_training_drawdown_pct": 0.02,
+            "cpu_count": 16,
+            "model_type": "PPO",
+            "policy_type": "MlpPolicy",
+            "window_size": 10,
+            "hidden_dim": 256,
+            "embedding_dim": 128,
+            "train_batch_size": 2048,
+            "mini_batch_size": 64,
+            "ppo_epochs": 10,
+            "learning_rate": 0.0003,
+            "model_reward_parameters": {
+                "rr": 1,
+                "profit_aim": 0.025
+            },
+            "model_training_parameters": {
+                "device": "cuda"
+            }
+        },
+        "model_training_parameters": {}
+    },
+    "bot_name": "FlagTrader",
+    "force_entry_enable": true,
+    "initial_state": "running",
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}
