@@ -13,7 +13,7 @@ from tensordict.nn import TensorDictModule
 from torch.distributions import Categorical
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import Categorical as CategoricalSpec
-from torchrl.data import LazyTensorStorage, ReplayBuffer
+from torchrl.data import LazyTensorStorage, ReplayBuffer, SamplerWithoutReplacement
 from torchrl.envs import Compose, GymWrapper, StepCounter, TransformedEnv
 from torchrl.modules import ProbabilisticActor, ValueOperator
 from torchrl.objectives import ClipPPOLoss
@@ -418,15 +418,26 @@ class FlagTraderTorchRL(ReinforcementLearner):
             entropy_coeff=entropy_coef,
             critic_coeff=1.0,
             loss_critic_type="l2",
+            normalize_advantage=True,  # 标准化 advantage 提高训练稳定性
+        )
+        loss_module.set_keys(advantage="advantage", value_target="value_target")
+
+        # Create optimizer with learning rate scheduler
+        learning_rate = self.rl_config.get("learning_rate", 3e-4)
+        optimizer = th.optim.Adam(loss_module.parameters(), lr=learning_rate)
+        total_batches = total_timesteps // frames_per_batch
+        scheduler = th.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=0.1,
+            total_iters=total_batches,
         )
 
-        # Create optimizer
-        optimizer = th.optim.Adam(loss_module.parameters(), lr=3e-4)
-
-        # Create replay buffer for PPO updates
+        # Create replay buffer for PPO updates (on-policy: 无放回采样)
         replay_buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=frames_per_batch),
             batch_size=mini_batch_size,
+            sampler=SamplerWithoutReplacement(),  # PPO on-policy 要求每个样本每 epoch 恰好使用一次
         )
 
         # Training loop using SyncDataCollector
@@ -458,11 +469,18 @@ class FlagTraderTorchRL(ReinforcementLearner):
                     th.nn.utils.clip_grad_norm_(loss_module.parameters(), 0.5)
                     optimizer.step()
 
+            # 更新学习率调度器
+            scheduler.step()
+
+            # 清空 replay buffer (on-policy 要求每批数据只使用一次)
+            replay_buffer.empty()
+
             # Logging
             if batch_idx % 5 == 0:
                 reward_t = tensordict_data["next", "reward"].reshape(-1)
                 action_t = tensordict_data["action"].reshape(-1)
-                self._log_training_progress(batch_idx, reward_t, action_t)
+                current_lr = scheduler.get_last_lr()[0]
+                self._log_training_progress(batch_idx, reward_t, action_t, current_lr)
 
         collector.shutdown()
         logger.info(f"Training finished in {time.time() - start_time:.2f}s")
@@ -470,7 +488,7 @@ class FlagTraderTorchRL(ReinforcementLearner):
         self.model = actor
 
         # Cleanup
-        del collector, loss_module, advantage_module, optimizer, replay_buffer
+        del collector, loss_module, advantage_module, optimizer, scheduler, replay_buffer
         del value_module, critic_net
         gc.collect()
         if th.cuda.is_available():
@@ -480,7 +498,11 @@ class FlagTraderTorchRL(ReinforcementLearner):
         return actor
 
     def _log_training_progress(
-        self, batch_idx: int, reward_t: th.Tensor, action_t: th.Tensor
+        self,
+        batch_idx: int,
+        reward_t: th.Tensor,
+        action_t: th.Tensor,
+        current_lr: float | None = None,
     ) -> None:
         """Log training progress."""
         avg_reward = reward_t.mean().item()
@@ -491,9 +513,10 @@ class FlagTraderTorchRL(ReinforcementLearner):
         )
         r_pos = (reward_t > 0).sum().item()
         r_neg = (reward_t < 0).sum().item()
+        lr_str = f", LR: {current_lr:.2e}" if current_lr is not None else ""
         logger.info(
             f"Batch {batch_idx}, Reward: {avg_reward:.4f} "
-            f"(+:{r_pos}, -:{r_neg}), Actions: [{action_dist}]"
+            f"(+:{r_pos}, -:{r_neg}), Actions: [{action_dist}]{lr_str}"
         )
 
     def predict(self, unfiltered_df, dk, **kwargs):
