@@ -11,9 +11,13 @@ import torch.nn as nn
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torch.distributions import Categorical
+from torchrl.collectors import SyncDataCollector
 from torchrl.data import Categorical as CategoricalSpec
+from torchrl.data import LazyTensorStorage, ReplayBuffer
+from torchrl.envs import Compose, GymWrapper, StepCounter, TransformedEnv
 from torchrl.modules import ProbabilisticActor, ValueOperator
 from torchrl.objectives import ClipPPOLoss
+from torchrl.objectives.value import GAE
 
 from freqtrade.freqai.prediction_models.ReinforcementLearner import ReinforcementLearner
 from freqtrade.freqai.RL.Base5ActionRLEnv import Actions, Positions
@@ -324,101 +328,29 @@ class FlagTraderTorchRL(ReinforcementLearner):
 
         return actor, value_module, critic_net
 
-    def _collect_rollout(
-        self, gym_env, actor: ProbabilisticActor, value_module: ValueOperator,
-        frames_per_batch: int, device: th.device
-    ) -> dict:
-        """Collect rollout data from environment."""
-        obs_list, action_list, reward_list, done_list = [], [], [], []
-        logprob_list, value_list, next_obs_list = [], [], []
+    def _create_env_maker(self, train_df, prices_train, env_info, device: th.device):
+        """Create environment factory function for TorchRL collector."""
+        # Capture references for closure
+        MyRLEnv = self.MyRLEnv
+        max_steps = len(train_df)
 
-        obs, _ = gym_env.reset()
-        obs_tensor = th.tensor(obs, dtype=th.float32, device=device).unsqueeze(0)
-
-        for _ in range(frames_per_batch):
-            with th.no_grad():
-                td_input = TensorDict({"observation": obs_tensor}, batch_size=[1])
-                td_output = actor(td_input)
-                action = td_output["action"].item()
-                logprob = td_output["action_log_prob"].item()
-                value = value_module(td_input)["state_value"].item()
-
-            next_obs, reward, terminated, truncated, _ = gym_env.step(action)
-            done = terminated or truncated
-
-            obs_list.append(obs)
-            next_obs_list.append(next_obs)
-            action_list.append(action)
-            reward_list.append(reward)
-            done_list.append(done)
-            logprob_list.append(logprob)
-            value_list.append(value)
-
-            obs = next_obs if not done else gym_env.reset()[0]
-            obs_tensor = th.tensor(obs, dtype=th.float32, device=device).unsqueeze(0)
-
-        return {
-            "obs": th.tensor(np.array(obs_list), dtype=th.float32, device=device),
-            "next_obs": th.tensor(np.array(next_obs_list), dtype=th.float32, device=device),
-            "action": th.tensor(action_list, dtype=th.long, device=device),
-            "reward": th.tensor(reward_list, dtype=th.float32, device=device),
-            "done": th.tensor(done_list, dtype=th.bool, device=device),
-            "logprob": th.tensor(logprob_list, dtype=th.float32, device=device),
-            "value": th.tensor(value_list, dtype=th.float32, device=device),
-        }
-
-    def _compute_gae(
-        self, rollout: dict, value_module: ValueOperator,
-        gamma: float, gae_lambda: float, device: th.device
-    ) -> tuple[th.Tensor, th.Tensor]:
-        """Compute Generalized Advantage Estimation."""
-        frames = rollout["obs"].shape[0]
-
-        with th.no_grad():
-            next_obs_td = TensorDict({"observation": rollout["next_obs"]}, batch_size=[frames])
-            next_values = value_module(next_obs_td)["state_value"].squeeze(-1)
-
-        advantages = th.zeros(frames, device=device)
-        returns = th.zeros(frames, device=device)
-        gae = 0.0
-
-        for t in reversed(range(frames)):
-            next_val = 0.0 if rollout["done"][t] else next_values[t].item()
-            delta = rollout["reward"][t] + gamma * next_val - rollout["value"][t]
-            gae = delta + gamma * gae_lambda * (1 - float(rollout["done"][t])) * gae
-            advantages[t] = gae
-            returns[t] = gae + rollout["value"][t]
-
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return advantages, returns
-
-    def _ppo_update(
-        self, tensordict_data: TensorDict, loss_module: ClipPPOLoss,
-        optimizer: th.optim.Optimizer, ppo_epochs: int, mini_batch_size: int, device: th.device
-    ) -> None:
-        """Perform PPO optimization steps."""
-        frames = tensordict_data.batch_size[0]
-
-        for _ in range(ppo_epochs):
-            indices = th.randperm(frames, device=device)
-            for start in range(0, frames, mini_batch_size):
-                end = start + mini_batch_size
-                subdata = tensordict_data[indices[start:end]]
-
-                loss_vals = loss_module(subdata)
-                loss_value = (
-                    loss_vals["loss_objective"]
-                    + loss_vals["loss_critic"]
-                    + loss_vals["loss_entropy"]
-                )
-
-                optimizer.zero_grad()
-                loss_value.backward()
-                th.nn.utils.clip_grad_norm_(loss_module.parameters(), 0.5)
-                optimizer.step()
+        def env_maker():
+            gym_env = MyRLEnv(df=train_df, prices=prices_train, **env_info)
+            gym_env = FlattenObsGymWrapper(gym_env)
+            # Use categorical_action_encoding=True to match our Categorical actor output
+            torchrl_env = GymWrapper(
+                gym_env,
+                device=device,
+                categorical_action_encoding=True,
+            )
+            return TransformedEnv(
+                torchrl_env,
+                Compose(StepCounter(max_steps=max_steps))
+            )
+        return env_maker
 
     def fit(self, data_dictionary, dk, **kwargs):
-        """Train the agent using TorchRL PPO."""
+        """Train the agent using TorchRL PPO with SyncDataCollector."""
         self._cleanup_memory()
 
         # Prepare data
@@ -450,54 +382,96 @@ class FlagTraderTorchRL(ReinforcementLearner):
         # Setup training components
         frames_per_batch = self.rl_config.get("train_batch_size", 2048)
         entropy_coef = self.rl_config.get("entropy_coef", 0.05)
-
-        loss_module = ClipPPOLoss(
-            actor_network=actor, critic_network=value_module, clip_epsilon=0.2,
-            entropy_bonus=True, entropy_coeff=entropy_coef, critic_coeff=1.0,
-            loss_critic_type="l2",
-        )
-        loss_module.set_keys(advantage="advantage", value_target="value_target")
-
-        optimizer = th.optim.Adam(loss_module.parameters(), lr=3e-4)
-
-        # Training loop
-        logger.info("Starting manual rollout training...")
-        start_time = time.time()
-
         ppo_epochs = self.rl_config.get("ppo_epochs", 10)
         mini_batch_size = self.rl_config.get("mini_batch_size", 64)
-        num_batches = total_timesteps // frames_per_batch
+        gamma = self.rl_config.get("gamma", 0.99)
+        gae_lambda = self.rl_config.get("gae_lambda", 0.95)
 
-        gym_env = self.MyRLEnv(df=train_df, prices=prices_train, **env_info)
-        gym_env = FlattenObsGymWrapper(gym_env)
+        # Create environment maker for collector
+        env_maker = self._create_env_maker(train_df, prices_train, env_info, device)
 
-        for batch_idx in range(num_batches):
-            rollout = self._collect_rollout(gym_env, actor, value_module, frames_per_batch, device)
-            advantages, returns = self._compute_gae(rollout, value_module, 0.99, 0.95, device)
+        # Create SyncDataCollector - handles rollout collection automatically
+        collector = SyncDataCollector(
+            env_maker,
+            policy=actor,
+            frames_per_batch=frames_per_batch,
+            total_frames=total_timesteps,
+            split_trajs=False,
+            device=device,
+        )
 
-            tensordict_data = TensorDict({
-                "observation": rollout["obs"],
-                "action": rollout["action"],
-                "action_log_prob": rollout["logprob"],
-                "state_value": rollout["value"].unsqueeze(-1),
-                "advantage": advantages.unsqueeze(-1),
-                "value_target": returns.unsqueeze(-1),
-            }, batch_size=[frames_per_batch])
+        # Create GAE module - handles advantage estimation automatically
+        advantage_module = GAE(
+            gamma=gamma,
+            lmbda=gae_lambda,
+            value_network=value_module,
+            average_gae=True,
+            vectorized=False,  # Set to False for stability with small batches
+        )
 
-            self._ppo_update(
-                tensordict_data, loss_module, optimizer, ppo_epochs, mini_batch_size, device
-            )
+        # Create PPO loss module
+        loss_module = ClipPPOLoss(
+            actor_network=actor,
+            critic_network=value_module,
+            clip_epsilon=0.2,
+            entropy_bonus=True,
+            entropy_coeff=entropy_coef,
+            critic_coeff=1.0,
+            loss_critic_type="l2",
+        )
 
+        # Create optimizer
+        optimizer = th.optim.Adam(loss_module.parameters(), lr=3e-4)
+
+        # Create replay buffer for PPO updates
+        replay_buffer = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=frames_per_batch),
+            batch_size=mini_batch_size,
+        )
+
+        # Training loop using SyncDataCollector
+        logger.info("Starting TorchRL SyncDataCollector training...")
+        start_time = time.time()
+
+        for batch_idx, tensordict_data in enumerate(collector):
+            # Compute advantages using GAE module
+            with th.no_grad():
+                advantage_module(tensordict_data)
+
+            # Flatten and add to replay buffer
+            data_view = tensordict_data.reshape(-1)
+            replay_buffer.extend(data_view.cpu())
+
+            # PPO update epochs
+            for _ in range(ppo_epochs):
+                for _ in range(frames_per_batch // mini_batch_size):
+                    subdata = replay_buffer.sample()
+                    loss_vals = loss_module(subdata.to(device))
+                    loss_value = (
+                        loss_vals["loss_objective"]
+                        + loss_vals["loss_critic"]
+                        + loss_vals["loss_entropy"]
+                    )
+
+                    optimizer.zero_grad()
+                    loss_value.backward()
+                    th.nn.utils.clip_grad_norm_(loss_module.parameters(), 0.5)
+                    optimizer.step()
+
+            # Logging
             if batch_idx % 5 == 0:
-                self._log_training_progress(batch_idx, rollout["reward"], rollout["action"])
+                reward_t = tensordict_data["next", "reward"].reshape(-1)
+                action_t = tensordict_data["action"].reshape(-1)
+                self._log_training_progress(batch_idx, reward_t, action_t)
 
-        gym_env.close()
+        collector.shutdown()
         logger.info(f"Training finished in {time.time() - start_time:.2f}s")
 
         self.model = actor
 
         # Cleanup
-        del loss_module, optimizer, value_module, critic_net
+        del collector, loss_module, advantage_module, optimizer, replay_buffer
+        del value_module, critic_net
         gc.collect()
         if th.cuda.is_available():
             th.cuda.empty_cache()
