@@ -6,6 +6,8 @@ config*.json
 logfile.txt
 user_data/*
 !user_data/config_flag_trader.json
+!user_data/config_flag_trader_llm.json
+!user_data/freqaimodels/FlagTraderLLM.py
 !user_data/strategy/sample_strategy.py
 !user_data/notebooks
 !user_data/models
