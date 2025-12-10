@@ -62,19 +62,15 @@ class PromptBuilder:
     """
     将数值市场状态转换为LLM可理解的文本prompt。
     参考FLAG-TRADER论文的prompt设计。
+    
+    优化: Action Space 放在开头，确保不会被截断。
     """
 
-    SYSTEM_PROMPT = """You are a professional cryptocurrency trader. Analyze the market data and decide the best trading action.
-Available actions: 0=Hold, 1=Long_Enter, 2=Long_Exit, 3=Short_Enter, 4=Short_Exit"""
+    # 简化的系统提示，包含完整的action定义（放在最前面，确保不被截断）
+    SYSTEM_PROMPT = """You are a crypto trader. Choose action 0-4:
+0=Hold, 1=Long_Enter, 2=Long_Exit, 3=Short_Enter, 4=Short_Exit"""
 
-    ACTION_SPACE_DESC = """Action Space:
-- 0 (Neutral): Do nothing, maintain current position
-- 1 (Long_Enter): Open a long position (buy)
-- 2 (Long_Exit): Close the long position (sell)
-- 3 (Short_Enter): Open a short position (sell short)
-- 4 (Short_Exit): Close the short position (buy to cover)"""
-
-    def __init__(self, feature_names: list[str] | None = None, max_features: int = 20):
+    def __init__(self, feature_names: list[str] | None = None, max_features: int = 50):
         """
         Args:
             feature_names: 特征名称列表
@@ -95,22 +91,22 @@ Available actions: 0=Hold, 1=Long_Enter, 2=Long_Exit, 3=Short_Enter, 4=Short_Exi
             feature_parts = []
             for i, (name, val) in enumerate(zip(self.feature_names, obs, strict=False)):
                 if i < self.max_features:
-                    feature_parts.append(f"{name}: {val:.4f}")
+                    # 简化特征名，去掉 %- 前缀
+                    clean_name = name.lstrip("%-")
+                    feature_parts.append(f"{clean_name}:{val:.4f}")
             feature_str = ", ".join(feature_parts)
             if len(obs) > self.max_features:
-                feature_str += f" ... ({len(obs) - self.max_features} more features)"
+                feature_str += f" (+{len(obs) - self.max_features} more)"
         else:
             # 没有feature names时使用简单格式
-            feature_str = f"Features: [{', '.join(f'{v:.4f}' for v in obs[:10])}...]"
+            feature_str = ", ".join(f"{v:.4f}" for v in obs[:10]) + "..."
 
+        # 优化后的prompt结构：Action定义在前，数据在后
         prompt = f"""{self.SYSTEM_PROMPT}
 
-Current Market State:
-{feature_str}
+Market: {feature_str}
 
-{self.ACTION_SPACE_DESC}
-
-Based on the above market data, what action should be taken?"""
+Action?"""
 
         return prompt
 
@@ -268,6 +264,18 @@ class LLMBackbone(nn.Module):
             truncation=True,
             max_length=self.max_length,
         )
+        
+        # 打印实际 token 数量
+        actual_length = tokens["input_ids"].shape[1]
+        if actual_length >= self.max_length:
+            logger.warning(
+                f"⚠️ Prompt truncated! Token count: {actual_length} >= max_length: {self.max_length}"
+            )
+        elif not hasattr(self, "_token_count_logged"):
+            # 只在第一次打印，避免刷屏
+            logger.info(f"Prompt token count: {actual_length}/{self.max_length}")
+            self._token_count_logged = True
+        
         return tokens["input_ids"].to(device), tokens["attention_mask"].to(device)
 
 
