@@ -15,6 +15,7 @@ import copy
 import gc
 import logging
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # GPU Memory Limit
 # ============================================================
-MAX_GPU_MEMORY_GB = 12.0
+MAX_GPU_MEMORY_GB = 24.0
 
 if th.cuda.is_available():
     total_mem = th.cuda.get_device_properties(0).total_memory
@@ -63,12 +64,15 @@ class PromptBuilder:
     将数值市场状态转换为LLM可理解的文本prompt。
     参考FLAG-TRADER论文的prompt设计。
     
-    优化: Action Space 放在开头，确保不会被截断。
+    优化: 
+    1. Action Space 放在开头，确保不会被截断
+    2. 持仓状态信息单独显示，便于LLM理解
     """
 
-    # 简化的系统提示，包含完整的action定义（放在最前面，确保不被截断）
+    # 系统提示（放在最前面，确保不被截断）
     SYSTEM_PROMPT = """You are a crypto trader. Choose action 0-4:
-0=Hold, 1=Long_Enter, 2=Long_Exit, 3=Short_Enter, 4=Short_Exit"""
+0=Hold, 1=Long_Enter, 2=Long_Exit, 3=Short_Enter, 4=Short_Exit
+Rules: Long_Enter/Short_Enter only when Neutral. Long_Exit only when Long. Short_Exit only when Short."""
 
     def __init__(self, feature_names: list[str] | None = None, max_features: int = 50):
         """
@@ -79,6 +83,15 @@ class PromptBuilder:
         self.feature_names = feature_names
         self.max_features = max_features
 
+    def _parse_position_value(self, pos_val: float) -> str:
+        """将position数值转换为可读字符串"""
+        if pos_val <= 0.25:
+            return "Short"
+        elif pos_val >= 0.75:
+            return "Long"
+        else:
+            return "Neutral"
+
     def build_prompt(self, obs: np.ndarray) -> str:
         """
         构建单个observation的prompt。
@@ -86,24 +99,52 @@ class PromptBuilder:
         Args:
             obs: 1D numpy array of features
         """
-        # 构建特征描述
+        # 分离状态信息和技术指标 (Portfolio Features)
+        position_str = "Neutral"
+        unrealized_pnl_str = "0.00%"
+        duration_str = "0"
+        total_profit_str = "0.00%"
+        cash_ratio_str = "100%"
+        
+        feature_parts = []
+        state_feature_count = 0  # 统计状态特征数量
+        
         if self.feature_names is not None:
-            feature_parts = []
             for i, (name, val) in enumerate(zip(self.feature_names, obs, strict=False)):
-                if i < self.max_features:
-                    # 简化特征名，去掉 %- 前缀
-                    clean_name = name.lstrip("%-")
+                clean_name = name.lstrip("%-")
+                
+                # 提取 Portfolio Features（状态信息）
+                if clean_name == "position":
+                    position_str = self._parse_position_value(val)
+                    state_feature_count += 1
+                elif clean_name == "unrealized_pnl":
+                    unrealized_pnl_str = f"{val*100:+.2f}%"  # 带符号显示
+                    state_feature_count += 1
+                elif clean_name == "trade_duration":
+                    duration_str = str(int(val))
+                    state_feature_count += 1
+                elif clean_name == "total_profit":
+                    total_profit_str = f"{val*100:+.2f}%"  # 带符号显示
+                    state_feature_count += 1
+                elif clean_name == "cash_ratio":
+                    cash_ratio_str = f"{val*100:.0f}%"
+                    state_feature_count += 1
+                elif i < self.max_features + state_feature_count:
+                    # 普通技术指标 (Market Features)
                     feature_parts.append(f"{clean_name}:{val:.4f}")
+            
             feature_str = ", ".join(feature_parts)
-            if len(obs) > self.max_features:
-                feature_str += f" (+{len(obs) - self.max_features} more)"
+            remaining = len(obs) - len(feature_parts) - state_feature_count
+            if remaining > 0:
+                feature_str += f" (+{remaining} more)"
         else:
             # 没有feature names时使用简单格式
             feature_str = ", ".join(f"{v:.4f}" for v in obs[:10]) + "..."
 
-        # 优化后的prompt结构：Action定义在前，数据在后
+        # 构建prompt：Portfolio状态在前，Market数据在后
         prompt = f"""{self.SYSTEM_PROMPT}
 
+Portfolio: Pos={position_str}, Cash={cash_ratio_str}, UnrealizedPnL={unrealized_pnl_str}, TotalPnL={total_profit_str}, Duration={duration_str}
 Market: {feature_str}
 
 Action?"""
@@ -515,8 +556,11 @@ class FlattenObsGymWrapper(gym.Wrapper):
         return self._process_obs(obs), info
 
     def step(self, action):
+        # 确保 action 是 Python 标量，避免 NumPy deprecation warning
         if hasattr(action, 'item'):
             action = action.item()
+        elif isinstance(action, np.ndarray):
+            action = action.flat[0] if action.size > 0 else 0
         obs, reward, terminated, truncated, info = self.env.step(int(action))
         return self._process_obs(obs), reward, terminated, truncated, info
 
@@ -554,20 +598,94 @@ class FlagTraderLLM(ReinforcementLearner):
     class MyRLEnv(ReinforcementLearner.MyRLEnv):
         """
         自定义RL环境，使用PnL驱动的reward设计。
+        强制添加持仓信息到observation中，供LLM理解当前状态。
         """
 
+        # Portfolio Features 数量（position, unrealized_pnl, trade_duration, total_profit, cash_ratio）
+        NUM_PORTFOLIO_FEATURES = 5
+
         # Reward constants (可通过config调整)
-        INVALID_ACTION_PENALTY = -2.0
-        EXIT_PROFIT_BASE = 10.0
-        EXIT_PROFIT_MULTIPLIER = 100
-        EXIT_LOSS_BASE = -1.0
-        EXIT_LOSS_MULTIPLIER = 50
-        ENTRY_REWARD = 1.0
-        HOLD_NEUTRAL_PENALTY = -0.5
-        HOLD_PROFIT_BASE = 0.5
-        HOLD_PROFIT_MULTIPLIER = 20
-        HOLD_LOSS_BASE = -0.1
-        HOLD_LOSS_MULTIPLIER = 10
+        # 优化版本：平衡各动作奖励，避免 mode collapse
+        INVALID_ACTION_PENALTY = -2.0       # 无效动作惩罚
+        EXIT_PROFIT_BASE = 2.0              # 盈利平仓基础奖励（降低：10->2）
+        EXIT_PROFIT_MULTIPLIER = 20         # 盈利平仓乘数（降低：100->20）
+        EXIT_LOSS_BASE = -2.0               # 亏损平仓基础惩罚（加强：-1->-2）
+        EXIT_LOSS_MULTIPLIER = 30           # 亏损平仓乘数（降低：50->30）
+        ENTRY_REWARD = 0.5                  # 入场奖励（降低：1->0.5，避免频繁开仓）
+        HOLD_NEUTRAL_PENALTY = -0.1         # 空仓持有惩罚（减轻：-0.5->-0.1，允许观望）
+        HOLD_PROFIT_BASE = 0.3              # 盈利持仓基础奖励
+        HOLD_PROFIT_MULTIPLIER = 10         # 盈利持仓乘数（降低：20->10）
+        HOLD_LOSS_BASE = -0.5               # 亏损持仓基础惩罚（加强：-0.1->-0.5）
+        HOLD_LOSS_MULTIPLIER = 15           # 亏损持仓乘数（增加：10->15）
+
+        def reset_env(self, df, prices, window_size, reward_kwargs, starting_point=True):
+            """
+            覆盖父类方法，更新observation_space以包含额外的Portfolio Features。
+            """
+            # 调用父类的reset_env
+            super().reset_env(df, prices, window_size, reward_kwargs, starting_point)
+            
+            # 更新total_features以包含Portfolio Features
+            self.total_features = self.signal_features.shape[1] + self.NUM_PORTFOLIO_FEATURES
+            self.shape = (window_size, self.total_features)
+            
+            # 更新observation_space
+            self.observation_space = gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=self.shape, dtype=np.float32
+            )
+            
+            logger.info(
+                f"MyRLEnv: observation_space updated to {self.shape} "
+                f"(+{self.NUM_PORTFOLIO_FEATURES} portfolio features)"
+            )
+
+        def _get_observation(self):
+            """
+            覆盖父类方法，强制添加持仓信息到observation中。
+            这样LLM就能知道当前是否有持仓，做出更合理的决策。
+            
+            添加的状态信息 (Portfolio Features):
+            - position: 0=Short, 0.5=Neutral, 1=Long
+            - unrealized_pnl: 当前未实现盈亏
+            - trade_duration: 当前持仓时长（candles）
+            - total_profit: 累计已实现收益
+            - cash_ratio: 现金比例 (1=全现金, 0=全仓位)
+            """
+            # 获取原始特征窗口
+            features_window = self.signal_features[
+                (self._current_tick - self.window_size) : self._current_tick
+            ]
+            
+            # 创建状态信息列
+            state_info = pd.DataFrame(
+                np.zeros((len(features_window), 5)),
+                columns=[
+                    "%-position", 
+                    "%-unrealized_pnl", 
+                    "%-trade_duration",
+                    "%-total_profit",
+                    "%-cash_ratio",
+                ],
+                index=features_window.index,
+            )
+            
+            # 填充状态信息（整个窗口使用当前状态）
+            state_info["%-position"] = self._position.value
+            state_info["%-unrealized_pnl"] = self.get_unrealized_profit()
+            state_info["%-trade_duration"] = self.get_trade_duration()
+            state_info["%-total_profit"] = self._total_profit - 1.0  # 转为收益率形式
+            
+            # cash_ratio: Neutral时=1（全现金），Long/Short时=0（全仓位）
+            # 这是简化模型，假设每次交易使用全部资金
+            if self._position == Positions.Neutral:
+                state_info["%-cash_ratio"] = 1.0
+            else:
+                state_info["%-cash_ratio"] = 0.0
+            
+            # 合并特征和状态信息
+            features_and_state = pd.concat([features_window, state_info], axis=1)
+            
+            return features_and_state
 
         def step(self, action):
             """确保action是int类型"""
@@ -923,6 +1041,13 @@ class FlagTraderLLM(ReinforcementLearner):
         使用LLM Backbone + PPO训练。
         实现FLAG-TRADER论文的训练流程。
         """
+        # 过滤 TorchRL 内部的 NumPy deprecation warning（来自 gym.py:1171）
+        warnings.filterwarnings(
+            "ignore",
+            message="Conversion of an array with ndim > 0 to a scalar is deprecated",
+            category=DeprecationWarning,
+        )
+        
         self._cleanup_memory()
 
         train_df = data_dictionary["train_features"]
