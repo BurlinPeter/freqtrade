@@ -605,18 +605,18 @@ class FlagTraderLLM(ReinforcementLearner):
         NUM_PORTFOLIO_FEATURES = 5
 
         # Reward constants (可通过config调整)
-        # 优化版本：平衡各动作奖励，避免 mode collapse
+        # 优化版本 v2：进一步平衡，减少 Exit 主导
         INVALID_ACTION_PENALTY = -2.0       # 无效动作惩罚
-        EXIT_PROFIT_BASE = 2.0              # 盈利平仓基础奖励（降低：10->2）
-        EXIT_PROFIT_MULTIPLIER = 20         # 盈利平仓乘数（降低：100->20）
-        EXIT_LOSS_BASE = -2.0               # 亏损平仓基础惩罚（加强：-1->-2）
-        EXIT_LOSS_MULTIPLIER = 30           # 亏损平仓乘数（降低：50->30）
-        ENTRY_REWARD = 0.5                  # 入场奖励（降低：1->0.5，避免频繁开仓）
-        HOLD_NEUTRAL_PENALTY = -0.1         # 空仓持有惩罚（减轻：-0.5->-0.1，允许观望）
+        EXIT_PROFIT_BASE = 1.5              # 盈利平仓基础奖励（再降：2->1.5）
+        EXIT_PROFIT_MULTIPLIER = 15         # 盈利平仓乘数（再降：20->15）
+        EXIT_LOSS_BASE = -2.0               # 亏损平仓基础惩罚
+        EXIT_LOSS_MULTIPLIER = 25           # 亏损平仓乘数（降低：30->25）
+        ENTRY_REWARD = 0.5                  # 入场奖励
+        HOLD_NEUTRAL_PENALTY = -0.05        # 空仓持有惩罚（再减：-0.1->-0.05）
         HOLD_PROFIT_BASE = 0.3              # 盈利持仓基础奖励
-        HOLD_PROFIT_MULTIPLIER = 10         # 盈利持仓乘数（降低：20->10）
-        HOLD_LOSS_BASE = -0.5               # 亏损持仓基础惩罚（加强：-0.1->-0.5）
-        HOLD_LOSS_MULTIPLIER = 15           # 亏损持仓乘数（增加：10->15）
+        HOLD_PROFIT_MULTIPLIER = 10         # 盈利持仓乘数
+        HOLD_LOSS_BASE = -0.5               # 亏损持仓基础惩罚
+        HOLD_LOSS_MULTIPLIER = 15           # 亏损持仓乘数
 
         def reset_env(self, df, prices, window_size, reward_kwargs, starting_point=True):
             """
