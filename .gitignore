@@ -9,10 +9,14 @@ user_data/*
 !user_data/config_flag_trader_llm.json
 !user_data/freqaimodels/FlagTraderLLM.py
 !user_data/strategy/sample_strategy.py
+!user_data/strategies/
+user_data/strategies/*
+!user_data/strategies/KronosStrategy.py
 !user_data/notebooks
 !user_data/models
 !user_data/freqaimodels
 user_data/freqaimodels/*
+!user_data/freqaimodels/KronosPredictorModel.py
 user_data/models/*
 user_data/notebooks/*
 freqtrade-plot.html
